@@ -11,25 +11,52 @@ BASE_URL = "https://wizzard.fun/api"
 
 ENERGY_CAP = [100, 150, 220, 300, 400, 500]
 ENERGY_RECOVERY_MINUTES = [20, 25, 30, 35, 40, 45]
+HP_RECOVERY_PER_MIN = 1.0
+RARITY_NAMES = ["Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic"]
 FULL_THRESHOLD = 1
 
 cached_token = None
+start_time = None
+start_amethyst = None
 
 def max_energy(hero):
     return ENERGY_CAP[hero.get("rarity", 0)]
 
-def hero_pct(hero):
+def max_hp(hero):
+    return hero["dur"] * 12 + 30
+
+def energy_pct(hero):
     return 100 * hero["energy"] / max_energy(hero)
 
+def hp_pct(hero):
+    return 100 * hero["durability"] / max_hp(hero)
+
 def is_full(hero):
-    return hero["energy"] >= max_energy(hero) - FULL_THRESHOLD
+    e_full = hero["energy"] >= max_energy(hero) - FULL_THRESHOLD
+    hp_full = hero["durability"] >= max_hp(hero) - FULL_THRESHOLD
+    return e_full and hp_full
 
 def time_to_full_seconds(hero):
     rarity = hero.get("rarity", 0)
     e_max = max_energy(hero)
-    remaining = e_max - hero["energy"]
-    rate = e_max / ENERGY_RECOVERY_MINUTES[rarity]
-    return (remaining / rate) * 60 if rate > 0 and remaining > 0 else 0
+    e_remaining = e_max - hero["energy"]
+    e_rate = e_max / ENERGY_RECOVERY_MINUTES[rarity]
+    e_time = (e_remaining / e_rate) * 60 if e_rate > 0 and e_remaining > 0 else 0
+
+    hp_remaining = max_hp(hero) - hero["durability"]
+    hp_time = (hp_remaining / HP_RECOVERY_PER_MIN) * 60 if hp_remaining > 0 else 0
+
+    return max(e_time, hp_time)
+
+def rarity_name(r):
+    return RARITY_NAMES[r] if r < len(RARITY_NAMES) else f"R{r}"
+
+def fmt_amount(n):
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.1f}K"
+    return str(n)
 
 def load_config():
     import os
@@ -57,7 +84,7 @@ def authenticate(cfg):
     global cached_token
     signing_key = get_keypair(cfg["private_key"])
     address = get_address(signing_key)
-    log(f"Authenticating wallet {address[:4]}...{address[-4:]}")
+    log(f"  Authenticating wallet {address[:4]}...{address[-4:]}")
 
     challenge = api_post_raw("wallet/challenge")
     if "error" in challenge:
@@ -85,7 +112,7 @@ def authenticate(cfg):
         raise Exception("Sign-in response missing token")
 
     cached_token = token
-    log("Authenticated OK")
+    log("  [OK] Authenticated!")
     return token
 
 def get_token(cfg):
@@ -140,16 +167,25 @@ def log(msg):
 
 def format_time(seconds):
     if seconds <= 0:
-        return "ready"
+        return "READY"
     m, s = divmod(int(seconds), 60)
+    if m >= 60:
+        h = m // 60
+        m = m % 60
+        return f"{h}h{m:02d}m"
     return f"{m}m{s:02d}s" if m else f"{s}s"
 
 def run():
+    global start_time, start_amethyst
     cfg = load_config()
     poll_interval = cfg.get("poll_interval_seconds", 30)
 
-    log("Wizzard bot started (auto-login, waits for 100% energy)")
-    log(f"Polling every {poll_interval}s")
+    print("", flush=True)
+    print("========================================", flush=True)
+    print("     Wizzard.fun -- Auto-Farm Bot       ", flush=True)
+    print("========================================", flush=True)
+    print("  Auto-login | 100% energy | Amethyst collect", flush=True)
+    print("", flush=True)
 
     consecutive_errors = 0
 
@@ -158,8 +194,8 @@ def run():
             token = get_token(cfg)
             state = api_post("state", token)
 
-            if state.get("error") == "HTTP 401: ":
-                log("Token expired, re-authenticating...")
+            if state.get("error") in ("HTTP 401: ", "HTTP 401: {}", "unauthorized"):
+                log("  Token expired, re-authenticating...")
                 global cached_token
                 cached_token = None
                 token = authenticate(cfg)
@@ -167,96 +203,123 @@ def run():
 
             if "error" in state:
                 consecutive_errors += 1
-                log(f"API error: {state['error']}")
+                log(f"  ERROR: {state['error']}")
                 if consecutive_errors > 10:
-                    log("Too many errors. Stopping.")
+                    log("  Too many errors. Stopping.")
                     break
                 time.sleep(min(poll_interval * consecutive_errors, 300))
                 continue
 
             consecutive_errors = 0
-            heroes = state["player"]["heroes"]
+            player = state["player"]
+            heroes = player["heroes"]
             online = state.get("online", "?")
+            amethyst = player.get("amethyst", 0)
+            chest = player.get("amethystChest", 0)
+            total_farmed = player.get("totalFarmed", 0)
+            best_floor = player.get("bestFloor", 0)
+            kills = player.get("totalKills", 0)
+
+            if start_time is None:
+                start_time = time.time()
+                start_amethyst = amethyst + chest
+
+            elapsed_hours = (time.time() - start_time) / 3600
+            earned_session = (amethyst + chest) - start_amethyst
+            daily_rate = (earned_session / elapsed_hours * 24) if elapsed_hours > 0.01 else 0
 
             fallen_ids = []
-            ready_ids = []
-            working = []
-            recovering = []
+            ready_heroes = []
+            working_heroes = []
+            resting_heroes = []
 
             for h in heroes:
-                hid = h["id"]
-                status = h["status"]
                 if h.get("benched", False):
                     continue
-
+                status = h["status"]
                 if status == "fallen":
-                    fallen_ids.append(hid)
+                    fallen_ids.append(h)
                 elif status == "resting":
-                    pct = hero_pct(h)
                     if is_full(h):
-                        ready_ids.append(hid)
+                        ready_heroes.append(h)
                     else:
-                        ttf = time_to_full_seconds(h)
-                        recovering.append((hid, pct, ttf))
+                        resting_heroes.append(h)
                 elif status == "working":
-                    working.append((hid, hero_pct(h)))
+                    working_heroes.append(h)
                 elif status == "idle":
                     if is_full(h):
-                        ready_ids.append(hid)
+                        ready_heroes.append(h)
 
-            parts = [f"Online: {online}"]
-            if working:
-                parts.append(f"Working: {[(hid, f'{p:.0f}%') for hid, p in working]}")
-            if ready_ids:
-                parts.append(f"Ready(100%): {ready_ids}")
+            total_active = len(working_heroes) + len(ready_heroes) + len(resting_heroes) + len(fallen_ids)
+
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] Checking heroes...", flush=True)
+            print(f"  {total_active} heroes -- {len(working_heroes)} working, {len(resting_heroes) + len(ready_heroes)} resting, {len(fallen_ids)} fallen", flush=True)
+            print(f"  Balance: {fmt_amount(amethyst)} | Chest: {fmt_amount(chest)} | Total farmed: {fmt_amount(total_farmed)}", flush=True)
+            print(f"  Best floor: {best_floor} | Kills: {kills:,} | Online: {online}", flush=True)
+            if elapsed_hours > 0.01:
+                print(f"  Session: +{fmt_amount(earned_session)} in {format_time(elapsed_hours * 3600)} | ~{fmt_amount(int(daily_rate))}/day", flush=True)
+
+            for h in working_heroes:
+                ep = energy_pct(h)
+                print(f"    #{h['id']} {rarity_name(h['rarity'])} ATK:{h['atk']} -- Working (Energy:{ep:.0f}%)", flush=True)
+            for h in resting_heroes:
+                ep = energy_pct(h)
+                hp = hp_pct(h)
+                ttf = time_to_full_seconds(h)
+                print(f"    #{h['id']} {rarity_name(h['rarity'])} ATK:{h['atk']} -- Energy:{ep:.0f}% HP:{hp:.0f}% ({format_time(ttf)} left)", flush=True)
+            for h in ready_heroes:
+                print(f"    #{h['id']} {rarity_name(h['rarity'])} ATK:{h['atk']} -- Energy:100% HP:100% (READY)", flush=True)
+            for h in fallen_ids:
+                print(f"    #{h['id']} {rarity_name(h['rarity'])} ATK:{h['atk']} -- FALLEN", flush=True)
+
             if fallen_ids:
-                parts.append(f"Fallen: {fallen_ids}")
-            if recovering:
-                parts.append(f"Recovering: {[(hid, f'{p:.0f}%', format_time(t)) for hid, p, t in recovering]}")
-            log(" | ".join(parts))
-
-            if fallen_ids:
-                log(f"  -> Resting fallen heroes: {fallen_ids}")
-                resp = api_post("heroes/rest", token, {"ids": fallen_ids})
+                ids = [h["id"] for h in fallen_ids]
+                log(f"  Resting {len(ids)} fallen heroes...")
+                resp = api_post("heroes/rest", token, {"ids": ids})
                 if "error" in resp:
-                    log(f"     Rest error: {resp['error']}")
+                    log(f"    [FAIL] {resp['error']}")
                 else:
-                    log(f"     Rested OK")
+                    log(f"    [OK] Rested")
 
-            if ready_ids:
-                log(f"  -> Sending 100% heroes to work: {ready_ids}")
-                resp = api_post("heroes/work", token, {"ids": ready_ids})
+            if ready_heroes:
+                ids = [h["id"] for h in ready_heroes]
+                print("", flush=True)
+                log(f"  Sending {len(ids)} heroes to work...")
+                for h in ready_heroes:
+                    print(f"    -> #{h['id']} {rarity_name(h['rarity'])} ATK:{h['atk']}", flush=True)
+                resp = api_post("heroes/work", token, {"ids": ids})
                 if "error" in resp:
-                    log(f"     Work error: {resp['error']}")
+                    log(f"    [FAIL] {resp['error']}")
                 else:
-                    log(f"     Sent to work OK")
+                    log(f"    [OK] {len(ids)} heroes sent!")
 
-            chest = state["player"].get("amethystChest", 0)
             if chest >= 2000:
-                log(f"  -> Collecting {chest:,} amethyst from chest")
+                log(f"  Collecting {fmt_amount(chest)} amethyst from chest...")
                 resp = api_post("amethyst/collect", token)
                 if "error" in resp:
-                    log(f"     Collect error: {resp['error']}")
+                    log(f"    [FAIL] {resp['error']}")
                 else:
-                    collected = resp.get("collected", resp.get("value", {}).get("collected", "?"))
-                    balance = resp.get("player", {}).get("amethyst", "?")
-                    log(f"     Collected {collected:,} | Balance: {balance:,}")
+                    collected = resp.get("collected", resp.get("value", {}).get("collected", 0))
+                    balance = resp.get("player", {}).get("amethyst", 0)
+                    log(f"    [OK] +{fmt_amount(collected)} | Balance: {fmt_amount(balance)}")
 
-            if recovering and not working and not ready_ids and not fallen_ids:
-                min_ttf = min(t for _, _, t in recovering)
+            if resting_heroes and not working_heroes and not ready_heroes and not fallen_ids:
+                min_ttf = min(time_to_full_seconds(h) for h in resting_heroes)
                 sleep_time = min(min_ttf + 10, 600)
-                log(f"  All recovering. Next ready in ~{format_time(min_ttf)}. Sleeping {format_time(sleep_time)}...")
+                log(f"  Next check in {format_time(sleep_time)}")
                 time.sleep(sleep_time)
                 continue
+
+            log(f"  Next check in {format_time(poll_interval)}")
 
         except KeyboardInterrupt:
             log("Stopped by user")
             break
         except Exception as e:
             consecutive_errors += 1
-            log(f"Unexpected error: {e}")
+            log(f"  ERROR: {e}")
             if consecutive_errors > 10:
-                log("Too many errors. Stopping.")
+                log("  Too many errors. Stopping.")
                 break
 
         time.sleep(poll_interval)
