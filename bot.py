@@ -32,21 +32,11 @@ def hp_pct(hero):
     return 100 * hero["durability"] / max_hp(hero)
 
 def is_full(hero):
-    e_full = hero["energy"] >= max_energy(hero) - FULL_THRESHOLD
-    hp_full = hero["durability"] >= max_hp(hero) - FULL_THRESHOLD
-    return e_full and hp_full
+    return hero["durability"] >= max_hp(hero) - FULL_THRESHOLD
 
 def time_to_full_seconds(hero):
-    rarity = hero.get("rarity", 0)
-    e_max = max_energy(hero)
-    e_remaining = e_max - hero["energy"]
-    e_rate = e_max / ENERGY_RECOVERY_MINUTES[rarity]
-    e_time = (e_remaining / e_rate) * 60 if e_rate > 0 and e_remaining > 0 else 0
-
     hp_remaining = max_hp(hero) - hero["durability"]
-    hp_time = (hp_remaining / HP_RECOVERY_PER_MIN) * 60 if hp_remaining > 0 else 0
-
-    return max(e_time, hp_time)
+    return (hp_remaining / HP_RECOVERY_PER_MIN) * 60 if hp_remaining > 0 else 0
 
 def rarity_name(r):
     return RARITY_NAMES[r] if r < len(RARITY_NAMES) else f"R{r}"
