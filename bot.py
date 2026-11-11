@@ -38,8 +38,11 @@ def load_config():
             "private_key": os.environ["PRIVATE_KEY"],
             "poll_interval_seconds": int(os.environ.get("POLL_INTERVAL", "30")),
         }
-    with open("config.json") as f:
-        return json.load(f)
+    try:
+        with open("config.json") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise SystemExit("Set PRIVATE_KEY env var or create config.json")
 
 def get_keypair(private_key_base58):
     import base58
