@@ -166,7 +166,7 @@ def format_time(seconds):
     return f"{m}m{s:02d}s" if m else f"{s}s"
 
 def run():
-    global start_time, start_amethyst
+    global start_time, start_amethyst, cached_token
     cfg = load_config()
     poll_interval = cfg.get("poll_interval_seconds", 30)
 
@@ -184,9 +184,9 @@ def run():
             token = get_token(cfg)
             state = api_post("state", token)
 
-            if state.get("error") in ("HTTP 401: ", "HTTP 401: {}", "unauthorized"):
+            err = state.get("error", "")
+            if "401" in str(err) or "unauthorized" in str(err).lower():
                 log("  Token expired, re-authenticating...")
-                global cached_token
                 cached_token = None
                 token = authenticate(cfg)
                 state = api_post("state", token)
@@ -272,16 +272,19 @@ def run():
                     log(f"    [OK] Rested")
 
             if ready_heroes:
-                ids = [h["id"] for h in ready_heroes]
                 print("", flush=True)
-                log(f"  Sending {len(ids)} heroes to work...")
+                log(f"  Sending {len(ready_heroes)} heroes to work...")
                 for h in ready_heroes:
-                    print(f"    -> #{h['id']} {rarity_name(h['rarity'])} ATK:{h['atk']}", flush=True)
-                resp = api_post("heroes/work", token, {"ids": ids})
-                if "error" in resp:
-                    log(f"    [FAIL] {resp['error']}")
-                else:
-                    log(f"    [OK] {len(ids)} heroes sent!")
+                    hid = h["id"]
+                    tag = f"#{hid} {rarity_name(h['rarity'])} ATK:{h['atk']}"
+                    resp = api_post("heroes/work", token, {"ids": [hid]})
+                    if resp.get("error") == "fallen":
+                        print(f"    -> {tag} -- not ready, resting", flush=True)
+                        api_post("heroes/rest", token, {"ids": [hid]})
+                    elif "error" in resp:
+                        print(f"    -> {tag} -- FAIL: {resp['error']}", flush=True)
+                    else:
+                        print(f"    -> {tag} -- sent!", flush=True)
 
             if chest >= 2000:
                 log(f"  Collecting {fmt_amount(chest)} amethyst from chest...")
