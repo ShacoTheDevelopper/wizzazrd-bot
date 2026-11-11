@@ -1,21 +1,22 @@
 import json
 import time
+import base64
 import urllib.request
 import urllib.error
 from datetime import datetime
+
+import nacl.signing
 
 BASE_URL = "https://wizzard.fun/api"
 
 ENERGY_CAP = [100, 150, 220, 300, 400, 500]
 ENERGY_RECOVERY_MINUTES = [20, 25, 30, 35, 40, 45]
-MANA_CAP = 100
 FULL_THRESHOLD = 1
+
+cached_token = None
 
 def max_energy(hero):
     return ENERGY_CAP[hero.get("rarity", 0)]
-
-def max_hp(hero):
-    return hero["dur"] * 12 + 30
 
 def hero_pct(hero):
     return 100 * hero["energy"] / max_energy(hero)
@@ -32,30 +33,91 @@ def time_to_full_seconds(hero):
 
 def load_config():
     import os
-    if os.environ.get("BEARER_TOKEN"):
+    if os.environ.get("PRIVATE_KEY"):
         return {
-            "bearer_token": os.environ["BEARER_TOKEN"],
-            "cf_clearance": os.environ.get("CF_CLEARANCE", ""),
-            "x_client": os.environ.get("X_CLIENT", ""),
+            "private_key": os.environ["PRIVATE_KEY"],
             "poll_interval_seconds": int(os.environ.get("POLL_INTERVAL", "30")),
         }
     with open("config.json") as f:
         return json.load(f)
 
-def build_headers(cfg):
+def get_keypair(private_key_base58):
+    import base58
+    secret = base58.b58decode(private_key_base58)
+    return nacl.signing.SigningKey(secret[:32])
+
+def get_address(signing_key):
+    import base58
+    return base58.b58encode(bytes(signing_key.verify_key)).decode()
+
+def authenticate(cfg):
+    global cached_token
+    signing_key = get_keypair(cfg["private_key"])
+    address = get_address(signing_key)
+    log(f"Authenticating wallet {address[:4]}...{address[-4:]}")
+
+    challenge = api_post_raw("wallet/challenge")
+    if "error" in challenge:
+        raise Exception(f"Challenge failed: {challenge['error']}")
+
+    nonce = challenge["nonce"]
+    message = challenge["message"].replace("<address>", address)
+    msg_bytes = message.encode("utf-8")
+    signed = signing_key.sign(msg_bytes)
+    signature = signed.signature
+
+    body = {
+        "nonce": nonce,
+        "address": address,
+        "signedMessage": base64.b64encode(msg_bytes).decode(),
+        "signature": base64.b64encode(signature).decode(),
+    }
+
+    resp = api_post_raw("wallet/sign-in", body)
+    if "error" in resp:
+        raise Exception(f"Sign-in failed: {resp['error']}")
+
+    token = resp.get("token")
+    if not token:
+        raise Exception("Sign-in response missing token")
+
+    cached_token = token
+    log("Authenticated OK")
+    return token
+
+def get_token(cfg):
+    global cached_token
+    if cached_token:
+        return cached_token
+    return authenticate(cfg)
+
+def build_headers(token):
     return {
         "Accept": "*/*",
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {cfg['bearer_token']}",
-        "Cookie": f"cf_clearance={cfg['cf_clearance']}",
-        "Origin": "https://wizzard.fun",
-        "Referer": "https://wizzard.fun/play",
+        "Authorization": f"Bearer {token}",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36",
-        "X-Client": cfg["x_client"],
     }
 
-def api_post(endpoint, headers, body=None):
+def api_post_raw(endpoint, body=None):
     data = json.dumps(body or {}).encode()
+    headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+    req = urllib.request.Request(f"{BASE_URL}/{endpoint}", data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode() if e.fp else ""
+        try:
+            return json.loads(body_text)
+        except Exception:
+            return {"error": f"HTTP {e.code}: {body_text[:200]}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+def api_post(endpoint, token, body=None):
+    data = json.dumps(body or {}).encode()
+    headers = build_headers(token)
     req = urllib.request.Request(f"{BASE_URL}/{endpoint}", data=data, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -73,18 +135,6 @@ def log(msg):
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
-def get_state(headers):
-    return api_post("state", headers)
-
-def send_to_work(headers, ids):
-    return api_post("heroes/work", headers, {"ids": ids})
-
-def send_to_rest(headers, ids):
-    return api_post("heroes/rest", headers, {"ids": ids})
-
-def collect_amethyst(headers):
-    return api_post("amethyst/collect", headers)
-
 def format_time(seconds):
     if seconds <= 0:
         return "ready"
@@ -93,29 +143,35 @@ def format_time(seconds):
 
 def run():
     cfg = load_config()
-    headers = build_headers(cfg)
     poll_interval = cfg.get("poll_interval_seconds", 30)
 
-    log("Wizzard bot started (waits for 100% before sending)")
+    log("Wizzard bot started (auto-login, waits for 100% energy)")
     log(f"Polling every {poll_interval}s")
 
     consecutive_errors = 0
 
     while True:
         try:
-            state = get_state(headers)
+            token = get_token(cfg)
+            state = api_post("state", token)
+
+            if state.get("error") == "HTTP 401: ":
+                log("Token expired, re-authenticating...")
+                global cached_token
+                cached_token = None
+                token = authenticate(cfg)
+                state = api_post("state", token)
 
             if "error" in state:
                 consecutive_errors += 1
                 log(f"API error: {state['error']}")
                 if consecutive_errors > 10:
-                    log("Too many errors. Token/cookie may have expired.")
+                    log("Too many errors. Stopping.")
                     break
                 time.sleep(min(poll_interval * consecutive_errors, 300))
                 continue
 
             consecutive_errors = 0
-            server_time = state["serverTime"]
             heroes = state["player"]["heroes"]
             online = state.get("online", "?")
 
@@ -127,9 +183,7 @@ def run():
             for h in heroes:
                 hid = h["id"]
                 status = h["status"]
-                benched = h.get("benched", False)
-
-                if benched:
+                if h.get("benched", False):
                     continue
 
                 if status == "fallen":
@@ -142,8 +196,7 @@ def run():
                         ttf = time_to_full_seconds(h)
                         recovering.append((hid, pct, ttf))
                 elif status == "working":
-                    pct = hero_pct(h)
-                    working.append((hid, pct))
+                    working.append((hid, hero_pct(h)))
                 elif status == "idle":
                     if is_full(h):
                         ready_ids.append(hid)
@@ -161,7 +214,7 @@ def run():
 
             if fallen_ids:
                 log(f"  -> Resting fallen heroes: {fallen_ids}")
-                resp = send_to_rest(headers, fallen_ids)
+                resp = api_post("heroes/rest", token, {"ids": fallen_ids})
                 if "error" in resp:
                     log(f"     Rest error: {resp['error']}")
                 else:
@@ -169,7 +222,7 @@ def run():
 
             if ready_ids:
                 log(f"  -> Sending 100% heroes to work: {ready_ids}")
-                resp = send_to_work(headers, ready_ids)
+                resp = api_post("heroes/work", token, {"ids": ready_ids})
                 if "error" in resp:
                     log(f"     Work error: {resp['error']}")
                 else:
@@ -178,7 +231,7 @@ def run():
             chest = state["player"].get("amethystChest", 0)
             if chest >= 2000:
                 log(f"  -> Collecting {chest:,} amethyst from chest")
-                resp = collect_amethyst(headers)
+                resp = api_post("amethyst/collect", token)
                 if "error" in resp:
                     log(f"     Collect error: {resp['error']}")
                 else:
