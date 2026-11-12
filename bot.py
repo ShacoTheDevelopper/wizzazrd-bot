@@ -238,11 +238,9 @@ def run():
 
             if "error" in state:
                 consecutive_errors += 1
-                log(f"  ERROR: {state['error']}")
-                if consecutive_errors > 10:
-                    log("  Too many errors. Stopping.")
-                    break
-                time.sleep(min(poll_interval * consecutive_errors, 300))
+                wait = min(30 * consecutive_errors, 300)
+                log(f"  ERROR: {state['error']} (retry in {format_time(wait)})")
+                time.sleep(wait)
                 continue
 
             consecutive_errors = 0
@@ -355,10 +353,9 @@ def run():
             break
         except Exception as e:
             consecutive_errors += 1
-            log(f"  ERROR: {e}")
-            if consecutive_errors > 10:
-                log("  Too many errors. Stopping.")
-                break
+            wait = min(30 * consecutive_errors, 300)
+            log(f"  ERROR: {e} (retry in {format_time(wait)})")
+            time.sleep(wait)
 
         time.sleep(poll_interval)
 
