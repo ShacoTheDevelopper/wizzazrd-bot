@@ -102,13 +102,42 @@ def authenticate(cfg):
         raise Exception("Sign-in response missing token")
 
     cached_token = token
+    save_token(token)
     log("  [OK] Authenticated!")
     return token
+
+TOKEN_FILE = "/tmp/wizzard_token.txt"
+
+def save_token(token):
+    try:
+        with open(TOKEN_FILE, "w") as f:
+            f.write(token)
+    except Exception:
+        pass
+
+def load_saved_token():
+    try:
+        with open(TOKEN_FILE) as f:
+            return f.read().strip()
+    except Exception:
+        return None
 
 def get_token(cfg):
     global cached_token
     if cached_token:
         return cached_token
+    import os
+    env_token = os.environ.get("TOKEN", "").strip()
+    if env_token:
+        log("  Using TOKEN from env")
+        cached_token = env_token
+        save_token(env_token)
+        return env_token
+    saved = load_saved_token()
+    if saved:
+        log("  Reusing saved token")
+        cached_token = saved
+        return saved
     return authenticate(cfg)
 
 def build_headers(token):
@@ -203,6 +232,7 @@ def run():
             if "401" in str(err) or "unauthorized" in str(err).lower():
                 log("  Token expired, re-authenticating...")
                 cached_token = None
+                save_token("")
                 token = authenticate(cfg)
                 state = api_post("state", token)
 
