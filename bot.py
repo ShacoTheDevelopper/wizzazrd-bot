@@ -329,7 +329,7 @@ def run():
                     else:
                         print(f"    -> {tag} -- sent!", flush=True)
 
-            if chest >= 2000:
+            if chest >= 2_000_000:
                 log(f"  Collecting {fmt_amount(chest)} amethyst from chest...")
                 resp = api_post("amethyst/collect", token)
                 if "error" in resp:
