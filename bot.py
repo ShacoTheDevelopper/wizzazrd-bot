@@ -117,23 +117,38 @@ def build_headers(token):
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36",
+        "Origin": "https://wizzard.fun",
+        "Referer": "https://wizzard.fun/",
     }
 
 def api_post_raw(endpoint, body=None):
     data = json.dumps(body or {}).encode()
-    headers = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
-    req = urllib.request.Request(f"{BASE_URL}/{endpoint}", data=data, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read())
-    except urllib.error.HTTPError as e:
-        body_text = e.read().decode() if e.fp else ""
+    headers = {
+        "Accept": "*/*",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36",
+        "Origin": "https://wizzard.fun",
+        "Referer": "https://wizzard.fun/",
+    }
+    for attempt in range(5):
+        req = urllib.request.Request(f"{BASE_URL}/{endpoint}", data=data, headers=headers, method="POST")
         try:
-            return json.loads(body_text)
-        except Exception:
-            return {"error": f"HTTP {e.code}: {body_text[:200]}"}
-    except Exception as e:
-        return {"error": str(e)}
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            body_text = e.read().decode() if e.fp else ""
+            if e.code == 403 and "Just a moment" in body_text:
+                wait = 5 * (attempt + 1)
+                log(f"    Cloudflare block, retrying in {wait}s ({attempt + 1}/5)")
+                time.sleep(wait)
+                continue
+            try:
+                return json.loads(body_text)
+            except Exception:
+                return {"error": f"HTTP {e.code}: {body_text[:200]}"}
+        except Exception as e:
+            return {"error": str(e)}
+    return {"error": "Cloudflare blocked after 5 retries"}
 
 def api_post(endpoint, token, body=None):
     data = json.dumps(body or {}).encode()
