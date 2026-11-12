@@ -336,7 +336,7 @@ def farm_loop(cfg):
                     else:
                         print(f"    -> {tag} -- sent!", flush=True)
 
-            if chest >= 2_000_000:
+            if chest >= 2_000_000_000:
                 log(f"  Collecting {fmt_amount(chest)} amethyst from chest...")
                 resp = api_post("amethyst/collect", token)
                 if "error" in resp:
@@ -346,10 +346,10 @@ def farm_loop(cfg):
                     balance = resp.get("player", {}).get("amethyst", 0)
                     log(f"    [OK] +{fmt_amount(collected)} | Balance: {fmt_amount(balance)}")
 
-            if resting_heroes and not working_heroes and not ready_heroes and not fallen_ids:
+            if resting_heroes and not ready_heroes and not fallen_ids:
                 min_ttf = min(time_to_full_seconds(h) for h in resting_heroes)
                 sleep_time = min(min_ttf + 10, 600)
-                log(f"  Next check in {format_time(sleep_time)}")
+                log(f"  Next hero ready in {format_time(min_ttf)}, checking in {format_time(sleep_time)}")
                 time.sleep(sleep_time)
                 continue
 
