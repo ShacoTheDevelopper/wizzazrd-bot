@@ -1,2 +1,3 @@
 PyNaCl
 base58
+discord.py

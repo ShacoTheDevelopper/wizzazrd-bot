@@ -1,11 +1,16 @@
 import json
 import time
 import base64
+import os
+import asyncio
+import threading
 import urllib.request
 import urllib.error
 from datetime import datetime
 
 import nacl.signing
+import discord
+from discord.ext import commands
 
 BASE_URL = "https://wizzard.fun/api"
 
@@ -18,6 +23,8 @@ FULL_THRESHOLD = 1
 cached_token = None
 start_time = None
 start_amethyst = None
+
+# --------------- helpers ---------------
 
 def max_energy(hero):
     return ENERGY_CAP[hero.get("rarity", 0)]
@@ -48,11 +55,26 @@ def fmt_amount(n):
         return f"{n/1_000:.1f}K"
     return str(n)
 
+def format_time(seconds):
+    if seconds <= 0:
+        return "READY"
+    m, s = divmod(int(seconds), 60)
+    if m >= 60:
+        h = m // 60
+        m = m % 60
+        return f"{h}h{m:02d}m"
+    return f"{m}m{s:02d}s" if m else f"{s}s"
+
+def log(msg):
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
+# --------------- config ---------------
+
 def load_config():
-    import os
     if os.environ.get("PRIVATE_KEY"):
         return {
-            "private_key": os.environ["PRIVATE_KEY"],
+            "private_key": os.environ["PRIVATE_KEY"].strip(),
             "poll_interval_seconds": int(os.environ.get("POLL_INTERVAL", "30")),
         }
     try:
@@ -60,6 +82,24 @@ def load_config():
             return json.load(f)
     except FileNotFoundError:
         raise SystemExit("Set PRIVATE_KEY env var or create config.json")
+
+# --------------- auth ---------------
+
+TOKEN_FILE = "/tmp/wizzard_token.txt"
+
+def save_token(token):
+    try:
+        with open(TOKEN_FILE, "w") as f:
+            f.write(token)
+    except Exception:
+        pass
+
+def load_saved_token():
+    try:
+        with open(TOKEN_FILE) as f:
+            return f.read().strip()
+    except Exception:
+        return None
 
 def get_keypair(private_key_base58):
     import base58
@@ -106,27 +146,10 @@ def authenticate(cfg):
     log("  [OK] Authenticated!")
     return token
 
-TOKEN_FILE = "/tmp/wizzard_token.txt"
-
-def save_token(token):
-    try:
-        with open(TOKEN_FILE, "w") as f:
-            f.write(token)
-    except Exception:
-        pass
-
-def load_saved_token():
-    try:
-        with open(TOKEN_FILE) as f:
-            return f.read().strip()
-    except Exception:
-        return None
-
 def get_token(cfg):
     global cached_token
     if cached_token:
         return cached_token
-    import os
     env_token = os.environ.get("TOKEN", "").strip()
     if env_token:
         log("  Using TOKEN from env")
@@ -139,6 +162,8 @@ def get_token(cfg):
         cached_token = saved
         return saved
     return authenticate(cfg)
+
+# --------------- API ---------------
 
 def build_headers(token):
     return {
@@ -166,7 +191,7 @@ def api_post_raw(endpoint, body=None):
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
             body_text = e.read().decode() if e.fp else ""
-            if e.code == 403 and "Just a moment" in body_text:
+            if e.code == 403 and "<!DOCTYPE html>" in body_text:
                 wait = 5 * (attempt + 1)
                 log(f"    Cloudflare block, retrying in {wait}s ({attempt + 1}/5)")
                 time.sleep(wait)
@@ -195,46 +220,28 @@ def api_post(endpoint, token, body=None):
     except Exception as e:
         return {"error": str(e)}
 
-def log(msg):
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
+def fetch_state(cfg):
+    global cached_token
+    token = get_token(cfg)
+    state = api_post("state", token)
+    err = state.get("error", "")
+    if "401" in str(err) or "unauthorized" in str(err).lower():
+        cached_token = None
+        save_token("")
+        token = authenticate(cfg)
+        state = api_post("state", token)
+    return token, state
 
-def format_time(seconds):
-    if seconds <= 0:
-        return "READY"
-    m, s = divmod(int(seconds), 60)
-    if m >= 60:
-        h = m // 60
-        m = m % 60
-        return f"{h}h{m:02d}m"
-    return f"{m}m{s:02d}s" if m else f"{s}s"
+# --------------- farming loop ---------------
 
-def run():
+def farm_loop(cfg):
     global start_time, start_amethyst, cached_token
-    cfg = load_config()
     poll_interval = cfg.get("poll_interval_seconds", 30)
-
-    print("", flush=True)
-    print("========================================", flush=True)
-    print("     Wizzard.fun -- Auto-Farm Bot       ", flush=True)
-    print("========================================", flush=True)
-    print("  Auto-login | 100% energy | Amethyst collect", flush=True)
-    print("", flush=True)
-
     consecutive_errors = 0
 
     while True:
         try:
-            token = get_token(cfg)
-            state = api_post("state", token)
-
-            err = state.get("error", "")
-            if "401" in str(err) or "unauthorized" in str(err).lower():
-                log("  Token expired, re-authenticating...")
-                cached_token = None
-                save_token("")
-                token = authenticate(cfg)
-                state = api_post("state", token)
+            token, state = fetch_state(cfg)
 
             if "error" in state:
                 consecutive_errors += 1
@@ -358,6 +365,186 @@ def run():
             time.sleep(wait)
 
         time.sleep(poll_interval)
+
+# --------------- Discord bot ---------------
+
+def make_discord_bot(cfg):
+    intents = discord.Intents.default()
+    intents.message_content = True
+    bot = commands.Bot(command_prefix="!", intents=intents)
+
+    @bot.event
+    async def on_ready():
+        log(f"  Discord bot online as {bot.user}")
+
+    @bot.command(name="status")
+    async def cmd_status(ctx):
+        """Full overview: balance, chest, heroes, session stats"""
+        try:
+            _, state = fetch_state(cfg)
+            if "error" in state:
+                await ctx.send(f"API error: {state['error']}")
+                return
+            p = state["player"]
+            heroes = p["heroes"]
+            amethyst = p.get("amethyst", 0)
+            chest = p.get("amethystChest", 0)
+            total_farmed = p.get("totalFarmed", 0)
+            best_floor = p.get("bestFloor", 0)
+            kills = p.get("totalKills", 0)
+            online = state.get("online", "?")
+
+            lines = [
+                f"**Balance:** {fmt_amount(amethyst)} | **Chest:** {fmt_amount(chest)}",
+                f"**Total farmed:** {fmt_amount(total_farmed)}",
+                f"**Best floor:** {best_floor} | **Kills:** {kills:,} | **Online:** {online}",
+            ]
+            if start_time and (time.time() - start_time) > 36:
+                elapsed_hours = (time.time() - start_time) / 3600
+                earned = (amethyst + chest) - (start_amethyst or 0)
+                daily = (earned / elapsed_hours * 24) if elapsed_hours > 0.01 else 0
+                lines.append(f"**Session:** +{fmt_amount(earned)} in {format_time(elapsed_hours * 3600)} | ~{fmt_amount(int(daily))}/day")
+
+            lines.append("")
+            for h in heroes:
+                if h.get("benched"):
+                    continue
+                ep = energy_pct(h)
+                hp = hp_pct(h)
+                st = h["status"].upper()
+                ttf = time_to_full_seconds(h)
+                ttf_str = f" ({format_time(ttf)} left)" if ttf > 0 else ""
+                lines.append(f"`#{h['id']}` {rarity_name(h['rarity'])} ATK:{h['atk']} -- **{st}** Energy:{ep:.0f}% HP:{hp:.0f}%{ttf_str}")
+
+            await ctx.send("\n".join(lines))
+        except Exception as e:
+            await ctx.send(f"Error: {e}")
+
+    @bot.command(name="balance")
+    async def cmd_balance(ctx):
+        """Show amethyst balance and chest"""
+        try:
+            _, state = fetch_state(cfg)
+            if "error" in state:
+                await ctx.send(f"API error: {state['error']}")
+                return
+            p = state["player"]
+            amethyst = p.get("amethyst", 0)
+            chest = p.get("amethystChest", 0)
+            total_farmed = p.get("totalFarmed", 0)
+            await ctx.send(
+                f"**Balance:** {fmt_amount(amethyst)}\n"
+                f"**Chest:** {fmt_amount(chest)}\n"
+                f"**Total farmed:** {fmt_amount(total_farmed)}"
+            )
+        except Exception as e:
+            await ctx.send(f"Error: {e}")
+
+    @bot.command(name="heroes")
+    async def cmd_heroes(ctx):
+        """List all heroes with stats"""
+        try:
+            _, state = fetch_state(cfg)
+            if "error" in state:
+                await ctx.send(f"API error: {state['error']}")
+                return
+            heroes = state["player"]["heroes"]
+            lines = []
+            for h in heroes:
+                ep = energy_pct(h)
+                hp = hp_pct(h)
+                mhp = max_hp(h)
+                me = max_energy(h)
+                st = h["status"].upper()
+                ttf = time_to_full_seconds(h)
+                ttf_str = f" ({format_time(ttf)} left)" if ttf > 0 else ""
+                benched = " [BENCHED]" if h.get("benched") else ""
+                lines.append(
+                    f"`#{h['id']}` **{rarity_name(h['rarity'])}** ATK:{h['atk']} DUR:{h['dur']}\n"
+                    f"    Status: **{st}**{benched} | Energy: {h['energy']:.0f}/{me} ({ep:.0f}%) | HP: {h['durability']:.0f}/{mhp} ({hp:.0f}%){ttf_str}"
+                )
+            await ctx.send("\n".join(lines) if lines else "No heroes found")
+        except Exception as e:
+            await ctx.send(f"Error: {e}")
+
+    @bot.command(name="chest")
+    async def cmd_chest(ctx):
+        """Show chest amount"""
+        try:
+            _, state = fetch_state(cfg)
+            if "error" in state:
+                await ctx.send(f"API error: {state['error']}")
+                return
+            chest = state["player"].get("amethystChest", 0)
+            await ctx.send(f"**Chest:** {fmt_amount(chest)}")
+        except Exception as e:
+            await ctx.send(f"Error: {e}")
+
+    @bot.command(name="collect")
+    async def cmd_collect(ctx):
+        """Force collect amethyst from chest"""
+        try:
+            token, state = fetch_state(cfg)
+            if "error" in state:
+                await ctx.send(f"API error: {state['error']}")
+                return
+            chest = state["player"].get("amethystChest", 0)
+            if chest == 0:
+                await ctx.send("Chest is empty, nothing to collect.")
+                return
+            resp = api_post("amethyst/collect", token)
+            if "error" in resp:
+                await ctx.send(f"Collect failed: {resp['error']}")
+            else:
+                collected = resp.get("collected", resp.get("value", {}).get("collected", 0))
+                balance = resp.get("player", {}).get("amethyst", 0)
+                await ctx.send(f"Collected **{fmt_amount(collected)}** | Balance: **{fmt_amount(balance)}**")
+        except Exception as e:
+            await ctx.send(f"Error: {e}")
+
+    @bot.command(name="wiz")
+    async def cmd_help(ctx):
+        """Show available commands"""
+        await ctx.send(
+            "**Wizzard Bot Commands:**\n"
+            "`!status` -- Full overview (balance, heroes, session)\n"
+            "`!balance` -- Amethyst balance & chest\n"
+            "`!heroes` -- List all heroes with detailed stats\n"
+            "`!chest` -- Chest amount\n"
+            "`!collect` -- Force collect amethyst from chest\n"
+            "`!wiz` -- This help message"
+        )
+
+    return bot
+
+# --------------- main ---------------
+
+def run():
+    cfg = load_config()
+
+    print("", flush=True)
+    print("========================================", flush=True)
+    print("     Wizzard.fun -- Auto-Farm Bot       ", flush=True)
+    print("========================================", flush=True)
+    print("  Auto-login | 100% HP | Amethyst collect", flush=True)
+    print("", flush=True)
+
+    discord_token = os.environ.get("DISCORD_TOKEN", "").strip()
+
+    if discord_token:
+        bot = make_discord_bot(cfg)
+
+        def start_farm():
+            time.sleep(5)
+            farm_loop(cfg)
+
+        farm_thread = threading.Thread(target=start_farm, daemon=True)
+        farm_thread.start()
+        log("  Starting Discord bot + farm loop...")
+        bot.run(discord_token, log_handler=None)
+    else:
+        log("  No DISCORD_TOKEN set, running farm loop only")
+        farm_loop(cfg)
 
 if __name__ == "__main__":
     run()
